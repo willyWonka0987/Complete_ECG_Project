@@ -1,0 +1,25 @@
+# تجاهل ملفات البيانات الضخمة
+*.npy
+*.pkl
+*.npz
+*.dat
+*.csv
+
+# تجاهل أي كاش أو نتائج
+__pycache__/
+*.log
+*.tmp
+
+# تجاهل أي مجلد بيانات
+*/Plots_Clean_Vs_Raw
+*/PQRST_TEST
+*/saved_models
+*/unified_ecg_dataset_v1
+*/RichECG_Datasets
+*/ptbxl_dl_dataset_v2
+*/Segments/
+*/cache_preds/
+*/Stacked_Model_Results/models
+
+# تجاهل أي ملف أكبر من 50MB (بالإضافة إلى التحديد اليدوي)
+
