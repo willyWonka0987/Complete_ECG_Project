@@ -41,7 +41,7 @@ PTBXL_USE_LR = True
 LSAD_ROOT = Path('../../dataset_new')
 RECORDS_TXT = LSAD_ROOT / 'RECORDS'
 LSAD_FS_ORIG = 500.0
-LSAD_FS_NEW  = 250.0
+LSAD_FS_NEW  = 100.0
 
 # ===============================
 # FILTERING & NORMALIZATION UTILS
