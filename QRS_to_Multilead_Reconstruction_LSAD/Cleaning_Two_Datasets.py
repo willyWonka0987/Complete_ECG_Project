@@ -17,7 +17,7 @@ from scipy.stats import skew, kurtosis
 # ---- Common
 LEAD_NAMES = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
 TARGET_LENGTH = 1000            # samples after (optional) resampling
-OUT_ROOT = Path('./unified_ecg_dataset_v1')
+OUT_ROOT = Path('./Cleaned_Raw_Datasets')
 PTBXL_OUT_DIR = OUT_ROOT / 'ptbxl_clean'
 LSAD_OUT_DIR  = OUT_ROOT / 'lsad_clean'
 MERGE_META_CSV = OUT_ROOT / 'merged_index.csv'   

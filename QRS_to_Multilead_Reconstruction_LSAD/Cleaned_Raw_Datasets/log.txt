@@ -1,0 +1,31 @@
+(base) youssef@D5-Ubuntu:~/Documents/ecg_reconstruction/QRS_to_Multilead_Reconstruction_LSAD$ python Cleaning_Two_Datasets.py
+
+=== PTB-XL: Loading metadata and filtering noisy rows ===
+Original shape: (21837, 28)
+After noise filtering: (13865, 28)
+Cleaning PTB-XL signals …
+PTB-XL: 100%|████████████████████████████████████████████████████████████████████████████████████████| 13865/13865 [00:08<00:00, 1697.73it/s]
+PTB-XL cleaned & saved: 9909 files -> unified_ecg_dataset_v1/ptbxl_clean
+PTB-XL rejected (low SNR or errors): 3956
+
+=== LSAD: Enumerating records from RECORDS file ===
+Found 45152 header files (.hea)
+Cleaning LSAD signals …
+LSAD:   3%|██▌                                                                                        | 1248/45152 [00:00<00:23, 1892.72it/s]LSAD error @ ../../dataset_new/WFDBRecords/01/019/JS01052.hea: time data '/' does not match format '%d/%m/%Y'
+LSAD:  51%|██████████████████████████████████████████████▎                                            | 23008/45152 [00:22<00:23, 935.77it/s]LSAD error @ ../../dataset_new/WFDBRecords/23/236/JS23074.hea: list index out of range
+LSAD: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 45152/45152 [00:45<00:00, 992.35it/s]
+LSAD cleaned & saved: 38240 files -> unified_ecg_dataset_v1/lsad_clean
+LSAD rejected (low SNR or errors): 6912
+
+Merging 59015 signals into a single memmap array …
+Merging: 100%|███████████████████████████████████████████████████████████████████████████████████████| 59015/59015 [00:08<00:00, 6866.73it/s]
+Memmap written to unified_ecg_dataset_v1/merged_ecg_signals.dat
+Saving a .npy copy of the merged memmap (optional)…
+Merged .npy saved -> unified_ecg_dataset_v1/merged_ecg_signals.npy
+
+✅ Done. You now have:
+ - PTB-XL cleaned signals in: unified_ecg_dataset_v1/ptbxl_clean
+ - LSAD cleaned signals in:  unified_ecg_dataset_v1/lsad_clean
+ - Merge index CSV:           unified_ecg_dataset_v1/merged_index.csv
+ - Merged memmap:             unified_ecg_dataset_v1/merged_ecg_signals.dat
+ - Merged NPY (optional):     unified_ecg_dataset_v1/merged_ecg_signals.npy

@@ -14,8 +14,14 @@ import matplotlib.pyplot as plt
 import os
 
 # --- Config ---
-DATA_DIR = Path("Segments/ptbxl")
-OUTPUT_DIR = Path("Stacked_Model_Results")
+import glob
+
+# اختار الداتاسيت: "ptbxl" أو "lsad"
+DATASET = "ptbxl"   # أو "lsad"
+
+DATA_DIR = Path(f"Segments_clean_raw/{DATASET}")
+OUTPUT_DIR = Path(f"Stacked_Model_Results_raw_clean_{DATASET}1")
+
 PLOTS_DIR = OUTPUT_DIR / "plots"
 MODELS_DIR = OUTPUT_DIR / "models"
 RMSE_PLOTS_DIR = PLOTS_DIR / "rmse_per_point"
@@ -23,6 +29,7 @@ for d in [OUTPUT_DIR, PLOTS_DIR, MODELS_DIR, RMSE_PLOTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 REPORT_FILE = OUTPUT_DIR / "evaluation_report.txt"
+
 
 INPUT_LEADS = ["I", "V2", "V6"]
 TARGET_LEADS = ["II", "V1", "V3", "V4", "V5"]
@@ -34,16 +41,43 @@ EPOCHS = 300
 LEARNING_RATE = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Load segments ---
-print("Loading segmented dataset...")
-train_segments = np.load(DATA_DIR / "train_segments.npy")
-val_segments = np.load(DATA_DIR / "val_segments.npy")
-test_segments = np.load(DATA_DIR / "test_segments.npy")
-print("Train:", train_segments.shape, "Val:", val_segments.shape, "Test:", test_segments.shape)
 
-# --- Load metadata/features from records.pkl ---
-with open(DATA_DIR / "records.pkl", "rb") as f:
-    records = pickle.load(f)
+# --- Loading Data ---
+def load_all_shards(data_dir, prefix):
+    # load all segments shards
+    seg_files = sorted(glob.glob(str(data_dir / f"{prefix}_segments_shard_*.npy")))
+    all_segments = [np.load(f, allow_pickle=True) for f in seg_files]
+    segments = np.concatenate(all_segments, axis=0)
+
+    # load all records shards
+    rec_files = sorted(glob.glob(str(data_dir / f"{prefix}_records_shard_*.pkl")))
+    all_records = []
+    for f in rec_files:
+        with open(f, "rb") as fh:
+            all_records.extend(pickle.load(fh))
+
+    return segments, all_records
+
+# ---- استدعاء ----
+segments, records = load_all_shards(DATA_DIR, prefix=DATASET)
+
+print("Total segments:", segments.shape)
+print("Total records:", len(records))
+
+# تقسيم train/val/test
+n = len(segments)
+train_end = int(0.7 * n)
+val_end   = int(0.85 * n)
+
+train_segments, val_segments, test_segments = (
+    segments[:train_end], segments[train_end:val_end], segments[val_end:]
+)
+
+train_records, val_records, test_records = (
+    records[:train_end], records[train_end:val_end], records[val_end:]
+)
+
+
 
 # --- Helper to flatten metadata dictionaries safely ---
 def flatten_meta(meta_dict):
@@ -59,21 +93,58 @@ def flatten_meta(meta_dict):
             flat.append(float(hash(str(v)) % (10**6)) / 1e6)
     return flat
 
-# --- Prepare metadata arrays ---
-def prepare_meta_arrays(records, segments):
+
+# --- Prepare metadata arrays (only age & sex from meta) ---
+def prepare_meta_arrays(records, segments, input_leads, use_raw=False, use_clean=True):
+    """
+    Extract features/raw_features for selected input leads,
+    and only age & sex from metadata.
+    """
     meta_list = []
     for rec in records[:len(segments)]:
-        meta_dict = rec.get("meta", {}) or {}
-        meta_arr = flatten_meta(meta_dict)
-        meta_list.append(meta_arr)
+        features = []
+
+        # 1️⃣ Add clean features (processed)
+        if use_clean and "features" in rec:
+            for lead in input_leads:
+                lead_feats = {k: v for k, v in rec["features"].items() if k.startswith(lead + "_")}
+                features.extend(list(lead_feats.values()))
+
+        # 2️⃣ Add raw features (from meta)
+        if use_raw and "meta" in rec and "raw_features" in rec["meta"]:
+            for lead in input_leads:
+                lead_feats = {k: v for k, v in rec["meta"]["raw_features"].items() if k.startswith(lead + "_")}
+                features.extend(list(lead_feats.values()))
+
+        # 3️⃣ Add only age & sex from meta
+        if "meta" in rec:
+            age = rec["meta"].get("age", 0.0)
+            sex = rec["meta"].get("sex", "M")  # string
+            # convert sex to numeric: M=0, F=1, else hash
+            if isinstance(sex, str):
+                if sex.upper() == "M":
+                    sex_val = 0.0
+                elif sex.upper() == "F":
+                    sex_val = 1.0
+                else:
+                    sex_val = float(hash(str(sex)) % (10**6)) / 1e6
+            else:
+                sex_val = float(sex)
+            features.extend([float(age), sex_val])
+
+        meta_list.append(np.array(features, dtype=np.float32))
+
+    # pad sequences to the same length
     max_len = max(len(m) for m in meta_list)
-    # Pad meta to max length
     meta_padded = np.array([np.pad(m, (0, max_len - len(m)), 'constant', constant_values=0.0) for m in meta_list], dtype=np.float32)
     return meta_padded
 
-train_meta = prepare_meta_arrays(records, train_segments)
-val_meta   = prepare_meta_arrays(records[len(train_segments):len(train_segments)+len(val_segments)], val_segments)
-test_meta  = prepare_meta_arrays(records[-len(test_segments):], test_segments)
+
+
+train_meta = prepare_meta_arrays(records, train_segments, INPUT_LEADS, use_raw=False, use_clean=True)
+val_meta   = prepare_meta_arrays(records[len(train_segments):len(train_segments)+len(val_segments)], val_segments, INPUT_LEADS, use_raw=False, use_clean=True)
+test_meta  = prepare_meta_arrays(records[-len(test_segments):], test_segments, INPUT_LEADS, use_raw=False, use_clean=True)
+
 
 print("Metadata shapes - Train:", train_meta.shape, "Val:", val_meta.shape, "Test:", test_meta.shape)
 
@@ -136,34 +207,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# --- CNN1D Model ---
-class CNN1D(nn.Module):
-    def __init__(self, in_channels=3, seq_len=128, output_dim=128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, padding=3),
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1),
-        )
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(128),
-            nn.Flatten(),
-            nn.Linear(64*128, 256),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.2),
-            nn.Linear(256, output_dim)
-        )
-
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        x = self.conv(x)
-        out = self.head(x)
-        return out
 
 # --- SSIM ---
 def compute_ssim_batch(y_true, y_pred):
@@ -181,7 +224,7 @@ def xgb_predict_full(models, X):
     return preds
 
 # --- Collect predictions ---
-def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefix):
+def collect_predictions(memmap_dir, dataset, mlp, xgb_models, device, prefix):
     """
     Robust prediction collector that accepts either:
       - dataset where X is flattened (use_meta=True) -> xb.dim() == 2
@@ -197,7 +240,7 @@ def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefi
 
     n_samples = len(dataset)
     seq_len = int(dataset[0][1].shape[0])
-    n_meta_models = 3  # MLP, XGB, CNN predictions per timepoint
+    n_meta_models = 2  # MLP, XGB predictions per timepoint
 
     meta_X = np.memmap(memmap_dir / f"{prefix}_metaX.dat", dtype="float32",
                        mode="w+", shape=(n_samples, seq_len, n_meta_models))
@@ -205,12 +248,10 @@ def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefi
                        mode="w+", shape=(n_samples, seq_len))
 
     mlp.eval()
-    cnn.eval()
 
     # helper info
     seg_flat_len = SEGMENT_LENGTH * len(INPUT_LEADS)
-
-    # find expected input dims for MLP and XGB (if available)
+     # find expected input dims for MLP and XGB (if available)
     try:
         mlp_input_dim = mlp.net[0].in_features
     except Exception:
@@ -244,8 +285,6 @@ def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefi
                 if xb.size(1) < seg_flat_len:
                     raise RuntimeError(f"collect_predictions: flattened input len {xb.size(1)} < expected segment flat length {seg_flat_len}")
                 seg_part = xb[:, :seg_flat_len].reshape(bsz, SEGMENT_LENGTH, len(INPUT_LEADS))
-                cnn_in = seg_part.to(device)  # (B, T, C)
-                cnn_out = cnn(cnn_in).cpu().numpy()  # (B, 128)
 
             # ---------- CASE B: structured input (use_meta=False) -> xb.dim() == 3 ----------
             elif xb.dim() == 3:
@@ -283,8 +322,6 @@ def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefi
                         Xb_flat = seg_flat_np
                 xgb_out = xgb_predict_full(xgb_models, Xb_flat)
 
-                # --- CNN ---
-                cnn_out = cnn(xb.to(device)).cpu().numpy()
 
             else:
                 raise RuntimeError(f"collect_predictions: unsupported xb.dim() = {xb.dim()}")
@@ -292,7 +329,6 @@ def collect_predictions(memmap_dir, dataset, mlp, xgb_models, cnn, device, prefi
             # write to memmap
             meta_X[idx:idx+bsz, :, 0] = mlp_out
             meta_X[idx:idx+bsz, :, 1] = xgb_out
-            meta_X[idx:idx+bsz, :, 2] = cnn_out
             meta_y[idx:idx+bsz] = yb.cpu().numpy()
             idx += bsz
 
@@ -313,8 +349,6 @@ with open(REPORT_FILE, "w") as report:
         val_ds   = RichECGDataset(val_segments, val_meta, INPUT_LEADS, lead, use_meta=True)
         test_ds  = RichECGDataset(test_segments, test_meta, INPUT_LEADS, lead, use_meta=True)
 
-        cnn_train_ds = RichECGDataset(train_segments, train_meta, INPUT_LEADS, lead, use_meta=False)
-        cnn_val_ds   = RichECGDataset(val_segments, val_meta, INPUT_LEADS, lead, use_meta=False)
 
         if len(train_ds) == 0:
             print(f"⚠️ Skipping {lead}: Not enough samples")
@@ -375,56 +409,6 @@ with open(REPORT_FILE, "w") as report:
 
         torch.save(mlp.state_dict(), MODELS_DIR / f"mlp_model_{lead}.pt")
 
-        # --- CNN training ---
-        cnn_model = CNN1D(in_channels=len(INPUT_LEADS), seq_len=SEGMENT_LENGTH, output_dim=SEGMENT_LENGTH).to(DEVICE)
-        cnn_optimizer = torch.optim.Adam(cnn_model.parameters(), lr=LEARNING_RATE)
-        cnn_loss_fn = nn.MSELoss()
-        cnn_best_val = float("inf")
-        cnn_counter = 0
-        cnn_best_state = None
-
-        cnn_train_loader = DataLoader(cnn_train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-        cnn_val_loader = DataLoader(cnn_val_ds, batch_size=BATCH_SIZE, drop_last=True)
-
-        for epoch in range(EPOCHS):
-            cnn_model.train()
-            total_loss = 0.0
-            for xb, yb in tqdm(cnn_train_loader, leave=False):
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                pred = cnn_model(xb)
-                loss = cnn_loss_fn(pred, yb)
-                cnn_optimizer.zero_grad()
-                loss.backward()
-                cnn_optimizer.step()
-                total_loss += loss.item() * xb.size(0)
-            avg_train_loss = total_loss / len(cnn_train_ds)
-
-            cnn_model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for xb, yb in cnn_val_loader:
-                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                    pred = cnn_model(xb)
-                    val_loss += cnn_loss_fn(pred, yb).item() * xb.size(0)
-            avg_val_loss = val_loss / len(cnn_val_ds)
-
-            print(f"[CNN] Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
-
-            if avg_val_loss < cnn_best_val:
-                cnn_best_val = avg_val_loss
-                cnn_best_state = cnn_model.state_dict()
-                cnn_counter = 0
-            else:
-                cnn_counter += 1
-                if cnn_counter >= patience:
-                    print(f"⏹ [CNN] Early stopping at epoch {epoch+1}")
-                    break
-
-        if cnn_best_state is not None:
-            cnn_model.load_state_dict(cnn_best_state)
-
-        torch.save(cnn_model.state_dict(), MODELS_DIR / f"cnn1d_model_{lead}.pt")
-
         # --- XGB training ---
         X_train = np.array([x.numpy().reshape(-1) for x, _ in train_ds])
         y_train = np.array([y.numpy() for _, y in train_ds])
@@ -438,14 +422,15 @@ with open(REPORT_FILE, "w") as report:
         xgb_model = xgb_models
 
         # --- Collect predictions ---
-        train_X, train_y = collect_predictions("cache_preds", train_ds, mlp, xgb_model, cnn_model, DEVICE, "train")
-        val_X, val_y = collect_predictions("cache_preds", val_ds, mlp, xgb_model, cnn_model, DEVICE, "val")
-        test_X, test_y = collect_predictions("cache_preds", test_ds, mlp, xgb_model, cnn_model, DEVICE, "test")
+        train_X, train_y = collect_predictions("cache_preds", train_ds, mlp, xgb_model, DEVICE, "train")
+        val_X, val_y = collect_predictions("cache_preds", val_ds, mlp, xgb_model, DEVICE, "val")
+        test_X, test_y = collect_predictions("cache_preds", test_ds, mlp, xgb_model, DEVICE, "test")
 
-        meta_X_train = train_X.reshape(-1, 3)
+        meta_X_train = train_X.reshape(-1, 2)
         meta_y_train = train_y.reshape(-1)
-        meta_X_test = test_X.reshape(-1, 3)
+        meta_X_test = test_X.reshape(-1, 2)
         meta_y_test = test_y.reshape(-1)
+
 
         meta_model = Ridge(alpha=1.0)
         meta_model.fit(meta_X_train, meta_y_train)
