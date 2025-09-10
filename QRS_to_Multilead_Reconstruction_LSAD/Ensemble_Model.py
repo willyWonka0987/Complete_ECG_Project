@@ -12,15 +12,12 @@ from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
-
-# --- Config ---
 import glob
 
-# اختار الداتاسيت: "ptbxl" أو "lsad"
+# --- Config ---
 DATASET = "ptbxl"   # أو "lsad"
-
-DATA_DIR = Path(f"Segments_clean_raw/{DATASET}")
-OUTPUT_DIR = Path(f"Stacked_Model_Results_raw_clean_{DATASET}1")
+DATA_DIR = Path(f"Segments/{DATASET}")
+OUTPUT_DIR = Path(f"Stacked_Model_Results_CNN_AVG_{DATASET}2")
 
 PLOTS_DIR = OUTPUT_DIR / "plots"
 MODELS_DIR = OUTPUT_DIR / "models"
@@ -28,8 +25,8 @@ RMSE_PLOTS_DIR = PLOTS_DIR / "rmse_per_point"
 for d in [OUTPUT_DIR, PLOTS_DIR, MODELS_DIR, RMSE_PLOTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-REPORT_FILE = OUTPUT_DIR / "evaluation_report.txt"
 
+REPORT_FILE = OUTPUT_DIR / "evaluation_report.txt"
 
 INPUT_LEADS = ["I", "V2", "V6"]
 TARGET_LEADS = ["II", "V1", "V3", "V4", "V5"]
@@ -41,47 +38,33 @@ EPOCHS = 300
 LEARNING_RATE = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 # --- Loading Data ---
 def load_all_shards(data_dir, prefix):
-    # load all segments shards
     seg_files = sorted(glob.glob(str(data_dir / f"{prefix}_segments_shard_*.npy")))
     all_segments = [np.load(f, allow_pickle=True) for f in seg_files]
     segments = np.concatenate(all_segments, axis=0)
 
-    # load all records shards
     rec_files = sorted(glob.glob(str(data_dir / f"{prefix}_records_shard_*.pkl")))
     all_records = []
     for f in rec_files:
         with open(f, "rb") as fh:
             all_records.extend(pickle.load(fh))
-
     return segments, all_records
 
-# ---- استدعاء ----
 segments, records = load_all_shards(DATA_DIR, prefix=DATASET)
-
 print("Total segments:", segments.shape)
 print("Total records:", len(records))
 
-# تقسيم train/val/test
+# --- Train/Val/Test split ---
 n = len(segments)
 train_end = int(0.7 * n)
 val_end   = int(0.85 * n)
 
-train_segments, val_segments, test_segments = (
-    segments[:train_end], segments[train_end:val_end], segments[val_end:]
-)
+train_segments, val_segments, test_segments = segments[:train_end], segments[train_end:val_end], segments[val_end:]
+train_records, val_records, test_records = records[:train_end], records[train_end:val_end], records[val_end:]
 
-train_records, val_records, test_records = (
-    records[:train_end], records[train_end:val_end], records[val_end:]
-)
-
-
-
-# --- Helper to flatten metadata dictionaries safely ---
+# --- Helper to flatten metadata ---
 def flatten_meta(meta_dict):
-    """Flatten nested metadata into a 1D array of numbers/floats."""
     flat = []
     for k, v in meta_dict.items():
         if isinstance(v, (list, np.ndarray)):
@@ -89,72 +72,48 @@ def flatten_meta(meta_dict):
         elif isinstance(v, (int, float)):
             flat.append(v)
         else:
-            # convert strings/bools to numeric hash to preserve uniqueness
             flat.append(float(hash(str(v)) % (10**6)) / 1e6)
     return flat
 
-
-# --- Prepare metadata arrays (only age & sex from meta) ---
+# --- Prepare metadata arrays ---
 def prepare_meta_arrays(records, segments, input_leads, use_raw=False, use_clean=True):
-    """
-    Extract features/raw_features for selected input leads,
-    and only age & sex from metadata.
-    """
     meta_list = []
     for rec in records[:len(segments)]:
         features = []
-
-        # 1️⃣ Add clean features (processed)
         if use_clean and "features" in rec:
             for lead in input_leads:
                 lead_feats = {k: v for k, v in rec["features"].items() if k.startswith(lead + "_")}
                 features.extend(list(lead_feats.values()))
-
-        # 2️⃣ Add raw features (from meta)
         if use_raw and "meta" in rec and "raw_features" in rec["meta"]:
             for lead in input_leads:
                 lead_feats = {k: v for k, v in rec["meta"]["raw_features"].items() if k.startswith(lead + "_")}
                 features.extend(list(lead_feats.values()))
-
-        # 3️⃣ Add only age & sex from meta
         if "meta" in rec:
             age = rec["meta"].get("age", 0.0)
-            sex = rec["meta"].get("sex", "M")  # string
-            # convert sex to numeric: M=0, F=1, else hash
+            sex = rec["meta"].get("sex", "M")
             if isinstance(sex, str):
-                if sex.upper() == "M":
-                    sex_val = 0.0
-                elif sex.upper() == "F":
-                    sex_val = 1.0
-                else:
-                    sex_val = float(hash(str(sex)) % (10**6)) / 1e6
+                sex_val = 0.0 if sex.upper()=="M" else 1.0
             else:
                 sex_val = float(sex)
             features.extend([float(age), sex_val])
-
         meta_list.append(np.array(features, dtype=np.float32))
-
-    # pad sequences to the same length
     max_len = max(len(m) for m in meta_list)
     meta_padded = np.array([np.pad(m, (0, max_len - len(m)), 'constant', constant_values=0.0) for m in meta_list], dtype=np.float32)
     return meta_padded
 
-
-
-train_meta = prepare_meta_arrays(records, train_segments, INPUT_LEADS, use_raw=False, use_clean=True)
-val_meta   = prepare_meta_arrays(records[len(train_segments):len(train_segments)+len(val_segments)], val_segments, INPUT_LEADS, use_raw=False, use_clean=True)
-test_meta  = prepare_meta_arrays(records[-len(test_segments):], test_segments, INPUT_LEADS, use_raw=False, use_clean=True)
-
+train_meta = prepare_meta_arrays(train_records, train_segments, INPUT_LEADS)
+val_meta   = prepare_meta_arrays(val_records, val_segments, INPUT_LEADS)
+test_meta  = prepare_meta_arrays(test_records, test_segments, INPUT_LEADS)
 
 print("Metadata shapes - Train:", train_meta.shape, "Val:", val_meta.shape, "Test:", test_meta.shape)
 
-# --- Dataset Class ---
+# --- Dataset ---
 class RichECGDataset(Dataset):
     def __init__(self, segments, meta_features, input_leads, target_lead, use_meta=True):
         self.samples = []
         self.use_meta = use_meta
         for idx, seg in enumerate(segments):
-            x_seg = np.stack([seg[:, ALL_LEADS.index(ld)] for ld in input_leads], axis=1)  # (128, C)
+            x_seg = np.stack([seg[:, ALL_LEADS.index(ld)] for ld in input_leads], axis=1)
             if self.use_meta:
                 x_meta = meta_features[idx]
                 x_seg_flat = x_seg.flatten().astype(np.float32)
@@ -182,7 +141,7 @@ def pearson_corr(y_true, y_pred):
     )
     return corr
 
-# --- MLP Model ---
+# --- MLP ---
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -207,6 +166,28 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+# --- 1D-CNN ---
+class CNN1D(nn.Module):
+    def __init__(self, n_channels, output_dim):
+        super().__init__()
+        self.conv_net = nn.Sequential(
+            nn.Conv1d(n_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+        self.fc = nn.Linear(64 * SEGMENT_LENGTH, output_dim)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.conv_net(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
 
 # --- SSIM ---
 def compute_ssim_batch(y_true, y_pred):
@@ -223,252 +204,171 @@ def xgb_predict_full(models, X):
         preds[:, t] = model.predict(X)
     return preds
 
-# --- Collect predictions ---
-def collect_predictions(memmap_dir, dataset, mlp, xgb_models, device, prefix):
-    """
-    Robust prediction collector that accepts either:
-      - dataset where X is flattened (use_meta=True) -> xb.dim() == 2
-      - dataset where X is (T, C) (use_meta=False) -> xb.dim() == 3
-
-    It reconstructs the CNN input from the flattened vector when needed,
-    and pads zeros for meta if a model (MLP/XGB) expects meta features but input
-    lacks them.
-    """
-    memmap_dir = Path(memmap_dir)
-    memmap_dir.mkdir(parents=True, exist_ok=True)
-    loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True)
-
-    n_samples = len(dataset)
-    seq_len = int(dataset[0][1].shape[0])
-    n_meta_models = 2  # MLP, XGB predictions per timepoint
-
-    meta_X = np.memmap(memmap_dir / f"{prefix}_metaX.dat", dtype="float32",
-                       mode="w+", shape=(n_samples, seq_len, n_meta_models))
-    meta_y = np.memmap(memmap_dir / f"{prefix}_metaY.dat", dtype="float32",
-                       mode="w+", shape=(n_samples, seq_len))
-
-    mlp.eval()
-
-    # helper info
-    seg_flat_len = SEGMENT_LENGTH * len(INPUT_LEADS)
-     # find expected input dims for MLP and XGB (if available)
-    try:
-        mlp_input_dim = mlp.net[0].in_features
-    except Exception:
-        # fallback: infer from a sample flattened x if possible
-        mlp_input_dim = None
-
-    xgb_input_dim = None
-    try:
-        # xgb_models is a list of per-timepoint models; they should all have n_features_in_
-        if len(xgb_models) > 0 and hasattr(xgb_models[0], "n_features_in_"):
-            xgb_input_dim = int(xgb_models[0].n_features_in_)
-    except Exception:
-        xgb_input_dim = None
-
-    idx = 0
-    with torch.no_grad():
-        for xb, yb in tqdm(loader, desc=f"Collecting {prefix} predictions"):
-            bsz = xb.shape[0]
-
-            # ---------- CASE A: flattened input (use_meta=True) -> xb.dim() == 2 ----------
-            if xb.dim() == 2:
-                # MLP: use full flattened vector (includes meta)
-                mlp_in = xb.to(device)  # shape (B, input_dim_expected_by_mlp)
-                mlp_out = mlp(mlp_in.view(bsz, -1)).cpu().numpy()  # (B, 128)
-
-                # XGB: flatten to numpy (same format used at training time)
-                Xb_flat = xb.cpu().numpy().reshape(bsz, -1)  # (B, input_dim_for_xgb)
-                xgb_out = xgb_predict_full(xgb_models, Xb_flat)  # (B, 128)
-
-                # CNN: reconstruct segment part from the first seg_flat_len values
-                if xb.size(1) < seg_flat_len:
-                    raise RuntimeError(f"collect_predictions: flattened input len {xb.size(1)} < expected segment flat length {seg_flat_len}")
-                seg_part = xb[:, :seg_flat_len].reshape(bsz, SEGMENT_LENGTH, len(INPUT_LEADS))
-
-            # ---------- CASE B: structured input (use_meta=False) -> xb.dim() == 3 ----------
-            elif xb.dim() == 3:
-                # xb shape is (B, T, C)
-                # Prepare seg_flat for mlp/xgb by flattening
-                seg_flat = xb.reshape(bsz, -1)  # (B, seg_flat_len)
-
-                # --- MLP ---
-                if mlp_input_dim is None:
-                    # we don't know expected mlp input dim -> try to use seg_flat only
-                    mlp_in_tensor = seg_flat.to(device)
-                else:
-                    # pad zeros for missing meta part
-                    if seg_flat.shape[1] > mlp_input_dim:
-                        raise RuntimeError(f"collect_predictions: segment flat size {seg_flat.shape[1]} > mlp expected input {mlp_input_dim}")
-                    pad_len = mlp_input_dim - seg_flat.shape[1]
-                    if pad_len > 0:
-                        pad_tensor = torch.zeros((bsz, pad_len), dtype=seg_flat.dtype)
-                        mlp_in_tensor = torch.cat([seg_flat, pad_tensor], dim=1).to(device)
-                    else:
-                        mlp_in_tensor = seg_flat.to(device)
-                mlp_out = mlp(mlp_in_tensor.view(bsz, -1)).cpu().numpy()
-
-                # --- XGB ---
-                seg_flat_np = seg_flat.cpu().numpy()
-                if xgb_input_dim is None:
-                    Xb_flat = seg_flat_np
-                else:
-                    if seg_flat_np.shape[1] > xgb_input_dim:
-                        raise RuntimeError(f"collect_predictions: segment flat size {seg_flat_np.shape[1]} > xgb expected input {xgb_input_dim}")
-                    pad_cols = xgb_input_dim - seg_flat_np.shape[1]
-                    if pad_cols > 0:
-                        Xb_flat = np.concatenate([seg_flat_np, np.zeros((bsz, pad_cols), dtype=np.float32)], axis=1)
-                    else:
-                        Xb_flat = seg_flat_np
-                xgb_out = xgb_predict_full(xgb_models, Xb_flat)
-
-
-            else:
-                raise RuntimeError(f"collect_predictions: unsupported xb.dim() = {xb.dim()}")
-
-            # write to memmap
-            meta_X[idx:idx+bsz, :, 0] = mlp_out
-            meta_X[idx:idx+bsz, :, 1] = xgb_out
-            meta_y[idx:idx+bsz] = yb.cpu().numpy()
-            idx += bsz
-
-    # finalise memmaps and return read-only views
-    del meta_X, meta_y
-    meta_X = np.memmap(memmap_dir / f"{prefix}_metaX.dat", dtype="float32", mode="r", shape=(n_samples, seq_len, n_meta_models))
-    meta_y = np.memmap(memmap_dir / f"{prefix}_metaY.dat", dtype="float32", mode="r", shape=(n_samples, seq_len))
-    print(f"[✓] Saved predictions for {prefix} at {memmap_dir} (rows={n_samples})")
-    return meta_X, meta_y
-
-
-# --- Training & Evaluation ---
+# --- Main Training Loop for all leads ---
 with open(REPORT_FILE, "w") as report:
     for lead in TARGET_LEADS:
-        print(f"\n🔧 Training stacked model for lead: {lead}...")
+        print(f"\n🔧 Processing lead: {lead}")
 
         train_ds = RichECGDataset(train_segments, train_meta, INPUT_LEADS, lead, use_meta=True)
         val_ds   = RichECGDataset(val_segments, val_meta, INPUT_LEADS, lead, use_meta=True)
         test_ds  = RichECGDataset(test_segments, test_meta, INPUT_LEADS, lead, use_meta=True)
 
-
         if len(train_ds) == 0:
             print(f"⚠️ Skipping {lead}: Not enough samples")
             continue
 
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, drop_last=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
 
-        # --- MLP training ---
+        # ----------------------------
+        # Step 1: Train MLP
+        # ----------------------------
         input_dim = train_ds[0][0].numel()
         output_dim = SEGMENT_LENGTH
         mlp = MLP(input_dim, output_dim).to(DEVICE)
-        loss_fn = nn.MSELoss()
+        loss_fn = nn.SmoothL1Loss()
         optimizer = torch.optim.Adam(mlp.parameters(), lr=LEARNING_RATE)
 
         best_val_loss = float("inf")
         patience, counter = 15, 0
-        best_model_state = None
+        best_state = None
 
         for epoch in range(EPOCHS):
             mlp.train()
-            total_loss = 0.0
-            for xb, yb in tqdm(train_loader, leave=False):
+            total_loss = 0
+            for xb, yb in train_loader:
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                xb = xb.view(xb.size(0), -1)
                 pred = mlp(xb)
                 loss = loss_fn(pred, yb)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item() * xb.size(0)
-            avg_train_loss = total_loss / len(train_ds)
+            avg_loss = total_loss / len(train_ds)
 
+            # Validation
             mlp.eval()
-            val_loss = 0.0
+            val_loss = 0
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                    xb_flat = xb.view(xb.size(0), -1)
-                    pred = mlp(xb_flat)
+                    pred = mlp(xb)
                     val_loss += loss_fn(pred, yb).item() * xb.size(0)
             avg_val_loss = val_loss / len(val_ds)
-
-            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
-
+            print(f"[MLP] Epoch {epoch+1} - Train Loss: {avg_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_model_state = mlp.state_dict()
+                best_state = mlp.state_dict()
                 counter = 0
             else:
                 counter += 1
                 if counter >= patience:
-                    print(f"⏹ Early stopping at epoch {epoch+1}")
+                    print("⏹ Early stopping MLP")
                     break
+        mlp.load_state_dict(best_state)
+        torch.save(mlp.state_dict(), MODELS_DIR / f"mlp_{lead}.pt")
 
-        if best_model_state is not None:
-            mlp.load_state_dict(best_model_state)
+        # ----------------------------
+        # Step 2: Train CNN
+        # ----------------------------
+        cnn_model = CNN1D(len(INPUT_LEADS), output_dim).to(DEVICE)
+        cnn_optimizer = torch.optim.Adam(cnn_model.parameters(), lr=LEARNING_RATE)
+        best_val_loss = float("inf")
+        counter = 0
+        best_state = None
 
-        torch.save(mlp.state_dict(), MODELS_DIR / f"mlp_model_{lead}.pt")
+        for epoch in range(EPOCHS):
+            cnn_model.train()
+            total_loss = 0
+            for xb, yb in train_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                xb_sig = xb[:, :SEGMENT_LENGTH*len(INPUT_LEADS)].view(xb.size(0), SEGMENT_LENGTH, len(INPUT_LEADS))
+                pred = cnn_model(xb_sig)
+                loss = loss_fn(pred, yb)
+                cnn_optimizer.zero_grad()
+                loss.backward()
+                cnn_optimizer.step()
+                total_loss += loss.item() * xb.size(0)
+            avg_loss = total_loss / len(train_ds)
 
-        # --- XGB training ---
+            cnn_model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                    xb_sig = xb[:, :SEGMENT_LENGTH*len(INPUT_LEADS)].view(xb.size(0), SEGMENT_LENGTH, len(INPUT_LEADS))
+                    pred = cnn_model(xb_sig)
+                    val_loss += loss_fn(pred, yb).item() * xb.size(0)
+            avg_val_loss = val_loss / len(val_ds)
+            print(f"[CNN] Epoch {epoch+1} - Train Loss: {avg_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_state = cnn_model.state_dict()
+                counter = 0
+            else:
+                counter += 1
+                if counter >= patience:
+                    print("⏹ Early stopping CNN")
+                    break
+        cnn_model.load_state_dict(best_state)
+        torch.save(cnn_model.state_dict(), MODELS_DIR / f"cnn_{lead}.pt")
+
+        # ----------------------------
+        # Step 3: Train XGB
+        # ----------------------------
         X_train = np.array([x.numpy().reshape(-1) for x, _ in train_ds])
         y_train = np.array([y.numpy() for _, y in train_ds])
-
         xgb_models = []
-        for t in tqdm(range(SEGMENT_LENGTH), desc=f"Training XGB for lead {lead}"):
+        for t in tqdm(range(SEGMENT_LENGTH), desc=f"Training XGB for {lead}"):
             model_t = XGBRegressor(tree_method="hist", n_jobs=-1, verbosity=0)
             model_t.fit(X_train, y_train[:, t])
             xgb_models.append(model_t)
 
-        xgb_model = xgb_models
+        with open(MODELS_DIR / f"xgb_{lead}.pkl", "wb") as f:
+            pickle.dump(xgb_models, f)
 
-        # --- Collect predictions ---
-        train_X, train_y = collect_predictions("cache_preds", train_ds, mlp, xgb_model, DEVICE, "train")
-        val_X, val_y = collect_predictions("cache_preds", val_ds, mlp, xgb_model, DEVICE, "val")
-        test_X, test_y = collect_predictions("cache_preds", test_ds, mlp, xgb_model, DEVICE, "test")
+        # ----------------------------
+        # Step 4: Average Ensembling
+        # ----------------------------
+        def collect_pred(ds):
+            mlp.eval()
+            cnn_model.eval()
+            Xb = []
+            Yb = []
+            loader = DataLoader(ds, batch_size=64)
+            with torch.no_grad():
+                for xb, yb in loader:
+                    xb, yb = xb.to(DEVICE), yb.numpy()
+                    # MLP
+                    pred_mlp = mlp(xb).cpu().numpy()
+                    # CNN
+                    xb_sig = xb[:, :SEGMENT_LENGTH*len(INPUT_LEADS)].view(xb.size(0), SEGMENT_LENGTH, len(INPUT_LEADS))
+                    pred_cnn = cnn_model(xb_sig).cpu().numpy()
+                    # XGB
+                    X_flat = xb.view(xb.size(0), -1).cpu().numpy()
+                    pred_xgb = xgb_predict_full(xgb_models, X_flat)
+                    # Average
+                    pred_avg = (pred_mlp + pred_cnn + pred_xgb) / 3.0
+                    Xb.append(pred_avg)
+                    Yb.append(yb)
+            return np.concatenate(Xb, axis=0), np.concatenate(Yb, axis=0)
 
-        meta_X_train = train_X.reshape(-1, 2)
-        meta_y_train = train_y.reshape(-1)
-        meta_X_test = test_X.reshape(-1, 2)
-        meta_y_test = test_y.reshape(-1)
+        # Get predictions
+        meta_pred, y_test_meta = collect_pred(test_ds)
 
+        # --- Evaluation ---
+        rmse = np.sqrt(mean_squared_error(y_test_meta.flatten(), meta_pred.flatten()))
+        r2 = r2_score(y_test_meta.flatten(), meta_pred.flatten())
+        pearson_corr_score = np.mean([pearsonr(y_test_meta[:, i], meta_pred[:, i])[0] 
+                                    for i in range(SEGMENT_LENGTH) if np.std(y_test_meta[:, i])>0])
+        ssim_score = compute_ssim_batch(y_test_meta, meta_pred)
 
-        meta_model = Ridge(alpha=1.0)
-        meta_model.fit(meta_X_train, meta_y_train)
-        meta_pred = meta_model.predict(meta_X_test).reshape(test_y.shape)
-
-        with open(MODELS_DIR / f"ridge_model_{lead}.pkl", "wb") as f:
-            pickle.dump(meta_model, f)
-        with open(MODELS_DIR / f"xgb_model_{lead}.pkl", "wb") as f:
-            pickle.dump(xgb_model, f)
-
-        # --- Metrics ---
-        rmse = np.sqrt(mean_squared_error(test_y.flatten(), meta_pred.flatten()))
-        r2 = r2_score(test_y.flatten(), meta_pred.flatten())
-        pearson_corr_score = np.mean([
-            pearsonr(test_y[:, i], meta_pred[:, i])[0]
-            for i in range(SEGMENT_LENGTH) if np.std(test_y[:, i]) > 0
-        ])
-        ssim_score = compute_ssim_batch(test_y, meta_pred)
-
-        print(f"\nLead {lead} Evaluation Summary:")
-        print(f"  RMSE         = {rmse:.4f}")
-        print(f"  R^2          = {r2:.4f}")
+        print(f"\nLead {lead} Evaluation Summary (Average Ensemble):")
+        print(f"  RMSE = {rmse:.4f}")
+        print(f"  R^2 = {r2:.4f}")
         print(f"  Pearson Corr = {pearson_corr_score:.4f}")
-        print(f"  SSIM         = {ssim_score:.4f}")
+        print(f"  SSIM = {ssim_score:.4f}")
 
-        rmse_per_point = np.sqrt(np.mean((test_y - meta_pred) ** 2, axis=0)).tolist()
-        report.write(f"\nEvaluation for Lead {lead}:\n")
-        report.write(f"RMSE: {rmse:.4f}\nR^2: {r2:.4f}\nPearson Correlation: {pearson_corr_score:.4f}\nSSIM: {ssim_score:.4f}\n")
-        report.write(f"RMSE per point (length {SEGMENT_LENGTH}):\n")
-        report.write(", ".join(f"{v:.6f}" for v in rmse_per_point) + "\n")
-
-        # --- Plot RMSE per point ---
-        plt.figure(figsize=(10, 4))
-        plt.plot(rmse_per_point, marker='o')
-        plt.title(f"RMSE per point - Lead {lead}")
-        plt.xlabel("Point index")
-        plt.ylabel("RMSE")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(RMSE_PLOTS_DIR / f"rmse_per_point_{lead}.png")
-        plt.close()
+        report.write(f"\nEvaluation for Lead {lead} (Average Ensemble):\n")
+        report.write(f"RMSE: {rmse:.4f}\nR^2: {r2:.4f}\nPearson: {pearson_corr_score:.4f}\nSSIM: {ssim_score:.4f}\n")

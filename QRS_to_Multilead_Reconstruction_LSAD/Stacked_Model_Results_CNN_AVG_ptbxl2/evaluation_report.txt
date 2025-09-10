@@ -1,0 +1,30 @@
+
+Evaluation for Lead II (Average Ensemble):
+RMSE: 0.0506
+R^2: 0.8266
+Pearson: 0.8240
+SSIM: 0.6942
+
+Evaluation for Lead V1 (Average Ensemble):
+RMSE: 0.0516
+R^2: 0.8818
+Pearson: 0.8505
+SSIM: 0.7039
+
+Evaluation for Lead V3 (Average Ensemble):
+RMSE: 0.0959
+R^2: 0.8273
+Pearson: 0.8707
+SSIM: 0.8096
+
+Evaluation for Lead V4 (Average Ensemble):
+RMSE: 0.0992
+R^2: 0.8044
+Pearson: 0.8185
+SSIM: 0.8118
+
+Evaluation for Lead V5 (Average Ensemble):
+RMSE: 0.0586
+R^2: 0.9215
+Pearson: 0.9035
+SSIM: 0.8559

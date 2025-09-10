@@ -1,4 +1,5 @@
 import os
+import ast
 import numpy as np
 import pandas as pd
 import wfdb
@@ -6,27 +7,27 @@ import wfdb
 from pathlib import Path
 from tqdm import tqdm
 from joblib import Parallel, delayed
-from scipy.signal import butter, filtfilt, medfilt, resample, welch
+from scipy.signal import butter, filtfilt, iirnotch, medfilt, resample, welch
 from scipy.stats import skew, kurtosis
 
 # ===============================
 # CONFIG
 # ===============================
 
-LEAD_NAMES = ['I','II','III','aVR','aVL','aVF','V1','V2','V3','V4','V5','V6']
-TARGET_LENGTH = 1000
-OUT_ROOT = Path('./Cleaned_Datasets')
+# ---- Common
+LEAD_NAMES = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
+TARGET_LENGTH = 1000            # samples after (optional) resampling
+OUT_ROOT = Path('./Cleaned_Raw_Datasets')
 PTBXL_OUT_DIR = OUT_ROOT / 'ptbxl_clean'
-PTBXL_RAW_DIR = OUT_ROOT / 'ptbxl_raw'
 LSAD_OUT_DIR  = OUT_ROOT / 'lsad_clean'
-LSAD_RAW_DIR  = OUT_ROOT / 'lsad_raw'
 MERGE_META_CSV = OUT_ROOT / 'merged_index.csv'
 MERGE_MEMMAP_PATH = OUT_ROOT / 'merged_ecg_signals.dat'
 MERGED_NPY = OUT_ROOT / 'merged_ecg_signals.npy'
 MERGED_FEATURES_CSV = OUT_ROOT / 'merged_features.csv'
 
-for d in [OUT_ROOT, PTBXL_OUT_DIR, LSAD_OUT_DIR, PTBXL_RAW_DIR, LSAD_RAW_DIR]:
+for d in [OUT_ROOT, PTBXL_OUT_DIR, LSAD_OUT_DIR]:  # <-- حذف RAW_DIRs
     d.mkdir(parents=True, exist_ok=True)
+
 
 # ---- PTB-XL ----
 PTBXL_PATH = Path('../../ptbxl')
@@ -42,25 +43,35 @@ LSAD_FS_ORIG = 500.0
 LSAD_FS_NEW  = 100.0
 
 # ===============================
-# FILTERING & NORMALIZATION UTILITIES
+# FILTERING & NORMALIZATION UTILS
 # ===============================
 
 def butter_bandpass_filter(data: np.ndarray, lowcut: float = 0.5, highcut: float = 45.0, fs: float = 100.0, order: int = 4) -> np.ndarray:
-    """Zero-phase Butterworth bandpass using filtfilt. Expects shape (T, C)."""
+    """Zero-phase Butterworth bandpass (filtfilt). Expects shape (T, C)."""
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
     b, a = butter(order, [low, high], btype='band')
     return filtfilt(b, a, data, axis=0)
 
-
 def baseline_wander_removal(data: np.ndarray, fs: float = 100.0, window_sec: float = 0.2) -> np.ndarray:
-    """Median-filter baseline removal. Expects shape (T, C)."""
+    """Median filter baseline removal. Expects shape (T, C)."""
     window_size = int(window_sec * fs)
     if window_size % 2 == 0:
         window_size += 1
     baseline = medfilt(data, kernel_size=(window_size, 1))
     return data - baseline
+
+def notch_filter(data: np.ndarray, fs: float = 100.0, freq: float = 50.0, Q: float = 30.0) -> np.ndarray:
+    """
+    Apply Notch filter (IIR) to remove powerline interference (50/60Hz).
+    Expects shape (T, C).
+    freq: تردد الضجيج (50Hz أو 60Hz)
+    Q: جودة الفلتر (كلما ارتفعت القيمة ضاق الفلتر أكثر)
+    """
+    w0 = freq / (fs / 2)  # Normalize freq
+    b, a = iirnotch(w0, Q)
+    return filtfilt(b, a, data, axis=0)
 
 
 def pad_or_trim(ecg: np.ndarray, targ_len: int = TARGET_LENGTH) -> np.ndarray:
@@ -72,35 +83,126 @@ def pad_or_trim(ecg: np.ndarray, targ_len: int = TARGET_LENGTH) -> np.ndarray:
 
 
 def normalize_ecg(data: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Per-lead z-score normalization: (x - mean) / std. Operates on shape (T, C)."""
+    """
+    Apply per-lead z-score normalization:
+      (x - mean) / std
+    Keeps ECG morphology while unifying scale across datasets.
+    """
     mean = np.mean(data, axis=0, keepdims=True)
     std = np.std(data, axis=0, keepdims=True) + eps
     return (data - mean) / std
 
 
 def compute_snr(raw: np.ndarray, filtered: np.ndarray) -> float:
-    """Compute SNR (dB) between raw and filtered signals."""
+    """احسب SNR بين raw (قبل الفلاتر) و filtered (بعد bandpass)."""
     noise = raw - filtered
     p_signal = np.mean(filtered ** 2)
-    p_noise = np.mean(noise ** 2) + 1e-8
-    return 10.0 * np.log10(p_signal / p_noise)
+    p_noise = np.mean(noise ** 2) + 1e-8  # لتفادي القسمة على صفر
+    snr_db = 10 * np.log10(p_signal / p_noise)
+    return snr_db
+
+
+def is_signal_valid(raw: np.ndarray, fs: float, snr_threshold: float = 5.0) -> bool:
+    """رجع True إذا الإشارة صالحة حسب SNR."""
+    filtered = butter_bandpass_filter(raw, fs=fs)
+    snr = compute_snr(raw, filtered)
+    return snr >= snr_threshold
 
 
 def clean_ecg_pipeline(arr: np.ndarray, fs: float) -> np.ndarray:
-    """Apply bandpass -> baseline removal -> pad/trim -> normalize.
-    Notch filter removed as requested.
-    Returns float32 array shaped (TARGET_LENGTH, C).
-    """
+    """Apply notch + bandpass + baseline removal + pad/trim, then normalization."""
+    # arr = notch_filter(arr, fs=fs, freq=50.0, Q=30.0)   # <-- جديد (ممكن تفعيله إذا احتجت)
     arr = butter_bandpass_filter(arr, fs=fs)
     arr = baseline_wander_removal(arr, fs=fs)
     arr = pad_or_trim(arr, targ_len=TARGET_LENGTH)
-    # arr = normalize_ecg(arr)
+    # arr = normalize_ecg(arr)   # <-- Normalization step (اختياري)
     return arr.astype(np.float32)
 
 
 def downsample_to(arr: np.ndarray, orig_fs: float, new_fs: float) -> np.ndarray:
+    """Resample along time axis to new_fs. Expects shape (T, C)."""
     n_samples_new = int(round(arr.shape[0] * new_fs / orig_fs))
     return resample(arr, n_samples_new, axis=0)
+
+# ===============================
+# FEATURE EXTRACTION
+# ===============================
+
+def _compute_bandpower_from_psd(f, pxx, low, high):
+    mask = (f >= low) & (f <= high)
+    if not np.any(mask):
+        return 0.0
+    return np.trapz(pxx[mask], f[mask])
+
+
+def extract_features_from_signal(sig: np.ndarray, fs: float) -> dict:
+    """Extract per-lead statistical and frequency-domain features.
+    Returns a flat dict of features keyed by <LEAD>_<feat>.
+    Expects sig shape (T, C) with C == len(LEAD_NAMES) ideally.
+    """
+    feats = {}
+    T, C = sig.shape
+    # ensure shape consistency
+    if C < len(LEAD_NAMES):
+        # pad with zeros
+        pad = np.zeros((T, len(LEAD_NAMES) - C), dtype=sig.dtype)
+        sig = np.concatenate([sig, pad], axis=1)
+    elif C > len(LEAD_NAMES):
+        sig = sig[:, :len(LEAD_NAMES)]
+
+    # PSD params
+    nperseg = min(1024, max(256, T))
+
+    bands = {
+        'bp_0_5_4': (0.5, 4.0),
+        'bp_4_15': (4.0, 15.0),
+        'bp_15_40': (15.0, 40.0),
+    }
+
+    for i, lead in enumerate(LEAD_NAMES):
+        x = sig[:, i].astype(np.float64)
+        # basic stats
+        feats[f"{lead}_mean"] = float(np.nanmean(x))
+        feats[f"{lead}_std"] = float(np.nanstd(x))
+        # skew/kurt: fall back to 0 for constant signals
+        try:
+            feats[f"{lead}_skew"] = float(skew(x))
+        except Exception:
+            feats[f"{lead}_skew"] = 0.0
+        try:
+            feats[f"{lead}_kurtosis"] = float(kurtosis(x))
+        except Exception:
+            feats[f"{lead}_kurtosis"] = 0.0
+        feats[f"{lead}_min"] = float(np.nanmin(x))
+        feats[f"{lead}_max"] = float(np.nanmax(x))
+        feats[f"{lead}_median"] = float(np.nanmedian(x))
+        feats[f"{lead}_rms"] = float(np.sqrt(np.nanmean(x ** 2)))
+        feats[f"{lead}_energy"] = float(np.nansum(x ** 2))
+        # zero-crossing rate (normalized)
+        if len(x) > 1:
+            zc = np.sum(np.abs(np.diff(np.sign(x)))) / (2.0 * (len(x) - 1))
+            feats[f"{lead}_zcr"] = float(zc)
+        else:
+            feats[f"{lead}_zcr"] = 0.0
+
+        # PSD / freq-domain
+        try:
+            f, pxx = welch(x, fs=fs, nperseg=min(nperseg, len(x)))
+            # dominant frequency
+            idx_max = np.nanargmax(pxx)
+            feats[f"{lead}_dom_freq"] = float(f[idx_max])
+            feats[f"{lead}_psd_total"] = float(np.trapz(pxx, f))
+            # band powers
+            for bname, (low, high) in bands.items():
+                bp = _compute_bandpower_from_psd(f, pxx, low, high)
+                feats[f"{lead}_{bname}"] = float(bp)
+        except Exception:
+            feats[f"{lead}_dom_freq"] = 0.0
+            feats[f"{lead}_psd_total"] = 0.0
+            for bname in bands.keys():
+                feats[f"{lead}_{bname}"] = 0.0
+
+    return feats
 
 # ===============================
 # PTB-XL LOADING & CLEANING
@@ -123,25 +225,28 @@ def _process_ptbxl_row(idx: int, row: pd.Series, out_dir: Path) -> dict:
     try:
         sig = _read_ptbxl_record(row)
 
-        # compute SNR on raw vs bandpass (full-length)
+        # compute SNR on raw vs bandpass (using full-length read signal)
         filtered_for_snr = butter_bandpass_filter(sig, fs=PTBXL_FS)
         snr_db = compute_snr(sig, filtered_for_snr)
+
+        # --- NEW: تحقق من SNR ---
         if snr_db < 5.0:
             return None
 
+        # create record id early so we can save clean with same id
         rec_id = f"ptbxl_{idx:07d}"
 
-        # Save raw (trimmed/padded) BEFORE filtering
-        raw_sig = pad_or_trim(sig, targ_len=TARGET_LENGTH).astype(np.float32)
-        raw_out_path = PTBXL_RAW_DIR / f"{rec_id}.npy"
-        np.save(raw_out_path, raw_sig)
 
-        # Cleaned signal: bandpass -> baseline -> pad -> normalize
+        # now apply the cleaning pipeline (bandpass + baseline + pad/trim)
         sig_clean = clean_ecg_pipeline(sig, fs=PTBXL_FS)
+
+        # features (from cleaned)
+        feats = extract_features_from_signal(sig_clean, fs=PTBXL_FS)
 
         out_path = out_dir / f"{rec_id}.npy"
         np.save(out_path, sig_clean)
 
+        # age/sex extraction (from row)
         age = None
         sex = None
         if 'age' in row.index:
@@ -150,6 +255,7 @@ def _process_ptbxl_row(idx: int, row: pd.Series, out_dir: Path) -> dict:
             except Exception:
                 age = row['age']
         if 'sex' in row.index:
+            # PTB-XL encodes sex sometimes as 1/0 or 'M'/'F'
             s = row['sex']
             if pd.isna(s):
                 sex = None
@@ -159,29 +265,24 @@ def _process_ptbxl_row(idx: int, row: pd.Series, out_dir: Path) -> dict:
                 except Exception:
                     sex = str(s)
 
+        # diagnosis (attempt to fetch scp_codes or similar)
         diagnosis = None
         for key in ['scp_codes', 'scps', 'diagnostic', 'diagnoses']:
             if key in row.index:
                 diagnosis = row[key]
                 break
-        
-        patient_id = None
-        if 'patient_id' in row.index:
-            patient_id = row['patient_id']
 
         meta = {
             'id': rec_id,
             'src': 'PTBXL',
             'path': str(out_path.resolve()),
-            'raw_path': str(raw_out_path.resolve()),
             'age': age,
             'sex': sex,
             'diagnosis': diagnosis,
             'snr_db': float(snr_db),
-            'patient_id': patient_id, 
         }
-
-
+        # merge feats into meta
+        meta.update(feats)
         return meta
     except Exception as e:
         print(f"PTB-XL error @ row {idx}: {e}")
@@ -191,6 +292,8 @@ def _process_ptbxl_row(idx: int, row: pd.Series, out_dir: Path) -> dict:
 def run_ptbxl_cleaning():
     print("\n=== PTB-XL: Loading metadata and filtering noisy rows ===")
     df = pd.read_csv(DATABASE_CSV)
+    print("Original shape:", df.shape)
+
     df = df[(df['validated_by_human'] == True) & (df['filename_lr'].notnull())]
 
     for col in ['electrodes_problems', 'pacemaker', 'burst_noise', 'static_noise']:
@@ -198,7 +301,13 @@ def run_ptbxl_cleaning():
             df[col] = 0
         df[col] = df[col].fillna(0)
 
-    df = df[(df['electrodes_problems'] == 0) & (df['pacemaker'] == 0) & (df['burst_noise'] == 0) & (df['static_noise'] == 0)]
+    df = df[
+        (df['electrodes_problems'] == 0) &
+        (df['pacemaker'] == 0) &
+        (df['burst_noise'] == 0) &
+        (df['static_noise'] == 0)
+    ]
+    print("After noise filtering:", df.shape)
 
     print("Cleaning PTB-XL signals …")
     results = Parallel(n_jobs=os.cpu_count() or 8, prefer="processes")(
@@ -207,6 +316,12 @@ def run_ptbxl_cleaning():
     )
 
     records = [r for r in results if r is not None]
+    n_ok = len(records)
+    n_rejected = len(results) - n_ok
+    print(f"PTB-XL cleaned & saved: {n_ok} files -> {PTBXL_OUT_DIR}")
+    print(f"PTB-XL rejected (low SNR or errors): {n_rejected}")
+
+    # save PTBXL metadata/features
     if records:
         df_meta = pd.DataFrame(records)
         df_meta.to_csv(PTBXL_OUT_DIR / 'ptbxl_metadata.csv', index=False)
@@ -246,39 +361,45 @@ def _process_lsad_record(idx: int, hea_file: Path, out_dir: Path) -> dict:
             return None
         sig = sig[:, :12].astype(np.float32)
 
+        # Keep first 5000 samples (500 Hz)
         if sig.shape[0] >= 5000:
             sig = sig[:5000, :]
 
         sig_down = downsample_to(sig, orig_fs=LSAD_FS_ORIG, new_fs=LSAD_FS_NEW)
 
+        # compute SNR on raw vs bandpass
         filtered_for_snr = butter_bandpass_filter(sig_down, fs=LSAD_FS_NEW)
         snr_db = compute_snr(sig_down, filtered_for_snr)
+
+        # --- NEW: تحقق من SNR ---
         if snr_db < 5.0:
             return None
 
+        # create rec id so we can save clean versions with same id
         rec_id = f"lsad_{idx:07d}"
 
-        raw_sig = pad_or_trim(sig_down, targ_len=TARGET_LENGTH).astype(np.float32)
-        raw_out_path = LSAD_RAW_DIR / f"{rec_id}.npy"
-        np.save(raw_out_path, raw_sig)
 
         sig_clean = clean_ecg_pipeline(sig_down, fs=LSAD_FS_NEW)
+
+        # features
+        feats = extract_features_from_signal(sig_clean, fs=LSAD_FS_NEW)
 
         out_path = out_dir / f"{rec_id}.npy"
         np.save(out_path, sig_clean)
 
+        # read age/sex/diagnosis from hea file
         age, sex, diagnosis = _read_age_sex_from_heafile(hea_file)
 
         meta = {
             'id': rec_id,
             'src': 'LSAD',
             'path': str(out_path.resolve()),
-            'raw_path': str(raw_out_path.resolve()),
             'age': age,
             'sex': sex,
             'diagnosis': diagnosis,
             'snr_db': float(snr_db),
         }
+        meta.update(feats)
         return meta
     except Exception as e:
         print(f"LSAD error @ {hea_file}: {e}")
@@ -304,6 +425,12 @@ def run_lsad_cleaning():
     )
 
     records = [r for r in results if r is not None]
+    n_ok = len(records)
+    n_rejected = len(results) - n_ok
+    print(f"LSAD cleaned & saved: {n_ok} files -> {LSAD_OUT_DIR}")
+    print(f"LSAD rejected (low SNR or errors): {n_rejected}")
+
+    # save LSAD metadata/features
     if records:
         df_meta = pd.DataFrame(records)
         df_meta.to_csv(LSAD_OUT_DIR / 'lsad_metadata.csv', index=False)
@@ -319,7 +446,8 @@ def _collect_npy_files() -> pd.DataFrame:
     for src, d in [('PTBXL', PTBXL_OUT_DIR), ('LSAD', LSAD_OUT_DIR)]:
         for p in sorted(d.glob('*.npy')):
             rows.append({'src': src, 'path': str(p.resolve())})
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    return df
 
 
 def build_merged_memmap():
@@ -328,6 +456,7 @@ def build_merged_memmap():
         print("No cleaned files found to merge. Run cleaners first.")
         return
 
+    print(f"\nMerging {len(df)} signals into a single memmap array …")
     MERGE_META_CSV.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(MERGE_META_CSV, index=False)
 
@@ -350,9 +479,13 @@ def build_merged_memmap():
         mm[i] = arr.astype(np.float32)
 
     del mm
+    print(f"Memmap written to {MERGE_MEMMAP_PATH}")
+
+    print("Saving a .npy copy of the merged memmap (optional)…")
     mm_read = np.memmap(MERGE_MEMMAP_PATH, dtype='float32', mode='r', shape=(N, T, C))
     np.save(MERGED_NPY, np.array(mm_read))
     del mm_read
+    print(f"Merged .npy saved -> {MERGED_NPY}")
 
 # ===============================
 # MAIN
@@ -361,6 +494,7 @@ if __name__ == '__main__':
     ptbxl_records = run_ptbxl_cleaning()
     lsad_records = run_lsad_cleaning()
 
+    # combine metadata/features from both sources into a single CSV
     all_records = []
     if ptbxl_records:
         all_records.extend(ptbxl_records)
@@ -369,8 +503,15 @@ if __name__ == '__main__':
 
     if all_records:
         df_all = pd.DataFrame(all_records)
-        df_all.to_csv(MERGE_META_CSV, index=False)
+        df_all.to_csv(MERGED_FEATURES_CSV, index=False)
+        print(f"Merged metadata & features saved -> {MERGED_FEATURES_CSV}")
 
     build_merged_memmap()
 
-    print("\n✅ Done.")
+    print("\n✅ Done. You now have:")
+    print(f" - PTB-XL cleaned signals in: {PTBXL_OUT_DIR}")
+    print(f" - LSAD cleaned signals in:  {LSAD_OUT_DIR}")
+    print(f" - Merge index CSV:           {MERGE_META_CSV}")
+    print(f" - Merged memmap:             {MERGE_MEMMAP_PATH}")
+    print(f" - Merged NPY (optional):     {MERGED_NPY}")
+    print(f" - Merged metadata/features:  {MERGED_FEATURES_CSV}")

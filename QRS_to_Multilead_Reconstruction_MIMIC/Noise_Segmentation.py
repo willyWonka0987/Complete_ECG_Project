@@ -7,9 +7,7 @@ import multiprocessing as mp
 import matplotlib.pyplot as plt
 import pickle
 import warnings
-import glob
 import pandas as pd
-
 from scipy.signal import welch
 from scipy.stats import skew, kurtosis, entropy as scipy_entropy
 
@@ -17,14 +15,13 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="neurokit2")
 
 # --- Configuration ---
-ROOT = Path("./Cleaned_Datasets")
+ROOT = Path("./Cleaned_Raw_Datasets")
 PTBXL_DIR = ROOT / "ptbxl_clean"
 LSAD_DIR = ROOT / "lsad_clean"
-PTBXL_Raw_DIR = ROOT / "ptbxl_raw"
-LSAD_Raw_DIR = ROOT / "lsad_raw"
+MERGED_META_CSV = ROOT / "merged_features.csv"
 PTBXL_META_CSV = PTBXL_DIR / "ptbxl_metadata.csv"
 LSAD_META_CSV = LSAD_DIR / "lsad_metadata.csv"
-SAVE_ROOT = Path("Segments")
+SAVE_ROOT = Path("Segments_clean")
 SAVE_ROOT.mkdir(parents=True, exist_ok=True)
 
 SAMPLING_RATE = 100
@@ -39,7 +36,6 @@ def pad_segment_centered(ecg, r_index, target_length):
     half = target_length // 2
     start = int(r_index - half)
     end = int(r_index + half)
-    # If ecg is None, return zeros with 12 leads
     if ecg is None:
         return np.zeros((target_length, len(LEAD_NAMES)), dtype=np.float32)
     segment = np.zeros((target_length, ecg.shape[1]), dtype=ecg.dtype)
@@ -90,21 +86,15 @@ def _safe_float(x):
             return None
 
 def compute_time_freq_features(sig, fs=SAMPLING_RATE):
-    """
-    Compute a compact set of time-domain and frequency-domain features for a 1D signal.
-    Returns a dict of scalar features (floats/ints).
-    """
     feats = {}
     sig = np.asarray(sig).astype(np.float64)
     if sig.size == 0:
-        # fallback zeros
         zero_feats = {
             'mean': 0.0, 'median': 0.0, 'std': 0.0, 'var': 0.0,
             'rms': 0.0, 'ptp': 0.0, 'mad': 0.0, 'skew': 0.0,
             'kurtosis': 0.0, 'zero_crossings': 0, 'energy': 0.0,
             'total_power': 0.0, 'spectral_entropy': 0.0, 'spectral_centroid': 0.0, 'peak_freq': 0.0
         }
-        # include band placeholders
         for b in [(0,5),(5,15),(15,40)]:
             zero_feats[f'band_{b[0]}_{b[1]}_power'] = 0.0
         return zero_feats
@@ -121,7 +111,6 @@ def compute_time_freq_features(sig, fs=SAMPLING_RATE):
     feats['zero_crossings'] = int(np.sum(np.diff(np.sign(sig)) != 0))
     feats['energy'] = _safe_float(np.sum(sig**2))
 
-    # PSD using Welch (robust). nperseg tuned not to exceed length.
     nperseg = min(256, max(8, sig.size))
     try:
         freqs, psd = welch(sig, fs=fs, nperseg=nperseg)
@@ -134,14 +123,12 @@ def compute_time_freq_features(sig, fs=SAMPLING_RATE):
             feats['spectral_entropy'] = 0.0
         feats['spectral_centroid'] = _safe_float(np.sum(freqs * psd) / (np.sum(psd) + 1e-12))
         feats['peak_freq'] = _safe_float(freqs[np.argmax(psd)]) if freqs.size > 0 else 0.0
-        # band powers (Hz) - choose bands useful for ECG waveform content
         bands = [(0,5),(5,15),(15,40)]
         for b in bands:
             idx = np.logical_and(freqs >= b[0], freqs <= b[1])
             bp = float(np.trapz(psd[idx], freqs[idx])) if idx.any() else 0.0
             feats[f'band_{b[0]}_{b[1]}_power'] = _safe_float(bp)
     except Exception:
-        # fallback safe values
         feats['total_power'] = 0.0
         feats['spectral_entropy'] = 0.0
         feats['spectral_centroid'] = 0.0
@@ -152,11 +139,6 @@ def compute_time_freq_features(sig, fs=SAMPLING_RATE):
     return feats
 
 def compute_multichannel_features(arr, fs=SAMPLING_RATE, lead_names=LEAD_NAMES):
-    """
-    Compute per-lead features and summary (mean/std across leads).
-    Returns a flat dict with keys like 'lead_I_mean', 'lead_V1_rms', and
-    'across_leads_mean_of_means', etc.
-    """
     out = {}
     arr = np.asarray(arr)
     n_samples, n_leads = arr.shape
@@ -164,10 +146,8 @@ def compute_multichannel_features(arr, fs=SAMPLING_RATE, lead_names=LEAD_NAMES):
         lead = lead_names[li] if li < len(lead_names) else f'lead_{li}'
         sig = arr[:, li]
         feats = compute_time_freq_features(sig, fs=fs)
-        # prefix each feature with lead name
         for k, v in feats.items():
             out[f'{lead}_{k}'] = v
-    # aggregated across leads
     try:
         means = [out[f'{lead_names[i]}_mean'] for i in range(min(len(lead_names), n_leads))]
         out['across_leads_mean_of_means'] = _safe_float(np.mean(means)) if len(means) > 0 else 0.0
@@ -177,29 +157,9 @@ def compute_multichannel_features(arr, fs=SAMPLING_RATE, lead_names=LEAD_NAMES):
         out['across_leads_std_of_means'] = 0.0
     return out
 
-def load_raw_map(folder: Path):
-    """Load all .npy raw files (12-lead) into a dict keyed by stem (filename without ext)."""
-    raw_map = {}
-    if folder is None or not folder.exists():
-        return raw_map
-    files = sorted(folder.glob("*.npy"))
-    for p in files:
-        try:
-            arr = np.load(p)
-            if arr.ndim == 2 and arr.shape[1] == 12:
-                raw_map[p.stem] = arr.astype(np.float32)
-        except Exception:
-            continue
-    return raw_map
-
 # --------------------- Core processing ---------------------
 
-def process_single_record(ecg, record_id, meta=None, raw_ecg=None):
-    """
-    ecg: cleaned/processed 2D array (T, C)
-    raw_ecg: (optional) raw 2D array (T, C) corresponding to the same record (used to extract raw_segment)
-    Returns: (records_out, local_segments) where records_out is list of rec_out dicts and local_segments list of clean segments arrays
-    """
+def process_single_record(ecg, record_id, meta=None):
     if ecg is None:
         return [], []
     if np.any(np.isnan(ecg)) or np.any(np.isinf(ecg)):
@@ -212,22 +172,6 @@ def process_single_record(ecg, record_id, meta=None, raw_ecg=None):
         ecg = np.concatenate([ecg, pad], axis=1)
     elif C > len(LEAD_NAMES):
         ecg = ecg[:, :len(LEAD_NAMES)]
-
-    # normalize/adjust raw_ecg channels shape if provided
-    if raw_ecg is not None:
-        try:
-            if raw_ecg.ndim != 2:
-                raw_ecg = None
-            else:
-                # pad/truncate channels to match LEAD_NAMES
-                Tr, Cr = raw_ecg.shape
-                if Cr < len(LEAD_NAMES):
-                    padr = np.zeros((Tr, len(LEAD_NAMES) - Cr), dtype=raw_ecg.dtype)
-                    raw_ecg = np.concatenate([raw_ecg, padr], axis=1)
-                elif Cr > len(LEAD_NAMES):
-                    raw_ecg = raw_ecg[:, :len(LEAD_NAMES)]
-        except Exception:
-            raw_ecg = None
 
     try:
         rpeaks_all = []
@@ -281,30 +225,18 @@ def process_single_record(ecg, record_id, meta=None, raw_ecg=None):
             if not valid:
                 continue
             segment = pad_segment_centered(ecg, ref_r, SEGMENT_LENGTH)
-            # compute features for this segment (multichannel)
             seg_fs = SAMPLING_RATE
             if isinstance(meta, dict):
-                # allow meta to override sampling rate if available
                 seg_fs = int(meta.get('sampling_rate', meta.get('fs', seg_fs)))
             seg_features = compute_multichannel_features(segment, fs=seg_fs, lead_names=LEAD_NAMES)
-
-            # extract corresponding raw segment if raw_ecg provided
-            raw_segment = None
-            if raw_ecg is not None:
-                try:
-                    raw_segment = pad_segment_centered(raw_ecg, ref_r, SEGMENT_LENGTH)
-                except Exception:
-                    raw_segment = None
 
             rec_out = {
                 "record_id": record_id,
                 "segment_index": None,
                 "segment": segment,
-                "raw_segment": raw_segment,            # NEW: store corresponding raw segment (or None)
                 "meta": dict(meta) if meta is not None else None,
-                "features": seg_features,   # features for this segment (time+freq per lead)
+                "features": seg_features,
             }
-            # if meta already contains raw_features (precomputed), keep it (no extra work here)
             records_out.append(rec_out)
             local_segments.append(segment)
 
@@ -313,32 +245,18 @@ def process_single_record(ecg, record_id, meta=None, raw_ecg=None):
         return [], []
 
 def process_record_wrapper(args):
-    """
-    args: (path, meta, raw_path_or_none)
-    """
-    path, meta, raw_path = args
+    path, meta = args
     try:
-        ecg = np.load(path, mmap_mode="r")   # lazy loading (ما ينحمل كامل بالذاكرة)
+        ecg = np.load(path, mmap_mode="r")
     except Exception:
         return [], []
     record_id = meta.get('id', Path(path).stem)
-    raw_ecg = None
-    if raw_path:
-        try:
-            raw_ecg = np.load(raw_path, mmap_mode="r")
-        except Exception:
-            raw_ecg = None
-    recs, segs = process_single_record(ecg, record_id, meta=meta, raw_ecg=raw_ecg)
+    recs, segs = process_single_record(ecg, record_id, meta=meta)
     return recs, segs
 
 # --------------------- Thresholding & Filtering ---------------------
 
 def compute_thresholds(all_records, amplitude_percentile=99.0):
-    """
-    Compute thresholds for each lead:
-    - RMS, STD, Zero-crossings → percentiles (0.5–99.0)
-    - Amplitude (abs max) → amplitude_percentile
-    """
     if len(all_records) == 0:
         return {}
     criteria = ["rms", "std", "zero_crossings", "amplitude"]
@@ -362,28 +280,17 @@ def compute_thresholds(all_records, amplitude_percentile=99.0):
         thresholds[lead] = {}
         for c in ["rms", "std", "zero_crossings"]:
             vals = np.array(lead_stats[lead][c])
-            if vals.size == 0:
-                thresholds[lead][c] = {"p0.5": 0.0, "p99.0": 0.0}
-            else:
-                thresholds[lead][c] = {
-                    "p0.5": float(np.percentile(vals, 0.5)),
-                    "p99.0": float(np.percentile(vals, 99.0))
-                }
-        # amplitude percentile
-        vals = np.array(lead_stats[lead]["amplitude"])
-        if vals.size == 0:
-            thresholds[lead]["amplitude"] = {"p99.0": 0.005}
-        else:
-            thresholds[lead]["amplitude"] = {
-                f"p{amplitude_percentile}": float(np.percentile(vals, amplitude_percentile))
+            thresholds[lead][c] = {
+                "p0.5": float(np.percentile(vals, 0.5)) if vals.size > 0 else 0.0,
+                "p99.0": float(np.percentile(vals, 99.0)) if vals.size > 0 else 0.0
             }
+        vals = np.array(lead_stats[lead]["amplitude"])
+        thresholds[lead]["amplitude"] = {
+            f"p{amplitude_percentile}": float(np.percentile(vals, amplitude_percentile)) if vals.size > 0 else 0.005
+        }
     return thresholds
 
-
 def filter_segments(all_records, all_segments, thresholds, save_rejected_dir):
-    """
-    Filter segments using thresholds
-    """
     if len(all_records) == 0:
         return [], []
     filtered_records, filtered_segments = [], []
@@ -396,19 +303,13 @@ def filter_segments(all_records, all_segments, thresholds, save_rejected_dir):
         segment = rec["segment"]
         reject = False
         reject_leads = []
-        reject_energy, reject_std, reject_zc = [], [], []
 
         for lead_idx, lead in enumerate(LEAD_NAMES):
             sig = segment[:, lead_idx]
-
-            # ---- amplitude check (dynamic) ----
             thr_amp = thresholds.get(lead, {}).get("amplitude", {}).get("p99.0", 0.005)
             if np.any(np.abs(sig) > thr_amp):
                 reject = True
                 reject_leads.append(lead + "_amplitude")
-                reject_energy.append(True)
-                reject_std.append(True)
-                reject_zc.append(True)
                 continue
 
             rms = np.sqrt(np.mean(sig**2))
@@ -418,9 +319,6 @@ def filter_segments(all_records, all_segments, thresholds, save_rejected_dir):
             if not (np.isfinite(rms) and np.isfinite(std) and np.isfinite(zero_crossings)):
                 reject = True
                 reject_leads.append(lead)
-                reject_energy.append(True)
-                reject_std.append(True)
-                reject_zc.append(True)
                 continue
 
             thr = thresholds.get(lead, None)
@@ -430,14 +328,10 @@ def filter_segments(all_records, all_segments, thresholds, save_rejected_dir):
                 rej_e = (rms < thr["rms"]["p0.5"]) or (rms > thr["rms"]["p99.0"])
                 rej_s = (std < thr["std"]["p0.5"]) or (std > thr["std"]["p99.0"])
                 rej_z = (zero_crossings < thr["zero_crossings"]["p0.5"]) or (zero_crossings > thr["zero_crossings"]["p99.0"])
-            reject_energy.append(rej_e)
-            reject_std.append(rej_s)
-            reject_zc.append(rej_z)
             if rej_e or rej_s or rej_z:
                 reject = True
                 reject_leads.append(lead)
 
-        # ---- store rejected images ----
         if reject:
             rejected_count += 1
             if rejected_count <= MAX_REJECTED_IMAGES:
@@ -463,16 +357,9 @@ def filter_segments(all_records, all_segments, thresholds, save_rejected_dir):
     print(f"✅ Total rejected segments: {rejected_count}")
     return filtered_records, filtered_segments
 
-
 # --------------------- Loaders ---------------------
 
-from pathlib import Path
-import pandas as pd
-
 def load_group_npy_files_with_meta(folder: Path, meta_csv: Path = None):
-    """
-    LSAD-friendly: لا تحمل الإشارات. رجّع فقط (path, meta).
-    """
     rows = []
     if meta_csv is not None and meta_csv.exists():
         try:
@@ -493,25 +380,15 @@ def load_group_npy_files_with_meta(folder: Path, meta_csv: Path = None):
             return rows
         except Exception:
             pass
-
-    # fallback: scan folder
     for p in sorted(folder.glob("*.npy")):
         meta = {'id': p.stem, 'path': str(p.resolve()), 'src': folder.name}
         rows.append((str(p.resolve()), meta))
     return rows
 
 # --------------------- Batch processing ---------------------
-import json
 
 def process_batch(dataset_with_meta, out_prefix, n_workers=None,
                   max_buffer=50000, sample_for_thresholds=5000):
-    """
-    Memory-efficient batch processor (LSAD-friendly).
-    - Uses lazy loading (mmap) in workers
-    - Streams segments to disk in shards
-    - Thresholds computed on a sample only
-    """
-
     save_dir = SAVE_ROOT / out_prefix
     save_dir.mkdir(parents=True, exist_ok=True)
     rejected_dir = save_dir / "rejected"
@@ -522,20 +399,10 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
         print("No records to process.")
         return
 
-    # Raw root
-    if out_prefix.lower().startswith("ptb"):
-        raw_root = PTBXL_Raw_DIR
-    elif out_prefix.lower().startswith("lsad"):
-        raw_root = LSAD_Raw_DIR
-    else:
-        raw_root = None
-
-    # Shuffle
     indices = np.arange(len(dataset_with_meta))
     np.random.shuffle(indices)
     shuffled = [dataset_with_meta[i] for i in indices]
 
-    # Workers
     cpu_count = mp.cpu_count() or 1
     if n_workers is None:
         n_workers = max(1, min(4, cpu_count - 1))
@@ -561,29 +428,16 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
 
     print("Extracting R-centered segments (streaming mode)...")
     with mp.Pool(processes=n_workers) as pool:
-        args = []
-        for item in shuffled:
-            path, meta = item
-            record_id = meta.get('id', Path(path).stem)
-            raw_path = None
-            if raw_root is not None:
-                candidate = raw_root / f"{record_id}.npy"
-                if candidate.exists():
-                    raw_path = str(candidate.resolve())
-            args.append((path, meta, raw_path))
-
-        for recs, segs in tqdm(pool.imap(process_record_wrapper, args),
-                               total=len(args)):
+        args = [(item[0], item[1]) for item in shuffled]
+        for recs, segs in tqdm(pool.imap(process_record_wrapper, args), total=len(args)):
             if recs:
                 buffer_records.extend(recs)
             if segs:
                 buffer_segments.extend(segs)
             if len(buffer_segments) >= max_buffer:
                 flush_shard()
-
     flush_shard()
 
-    # ---- Compute thresholds ----
     print("Computing thresholds from sample...")
     sample_records = []
     shard_files = sorted(save_dir.glob(f"{out_prefix}_records_shard_*.pkl"))
@@ -594,10 +448,10 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
         if len(sample_records) >= sample_for_thresholds:
             break
     thresholds = compute_thresholds(sample_records)
+    import json
     with open(save_dir / "thresholds.json", "w") as f:
         json.dump(thresholds, f, indent=2)
 
-    # ---- Filtering ----
     print("Filtering and splitting...")
     all_segments_final, all_records_final = [], []
     shard_files = sorted(save_dir.glob(f"{out_prefix}_segments_shard_*.npy"))
@@ -607,7 +461,6 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
         segs = np.load(seg_path, mmap_mode="r")
         with open(rec_path, "rb") as f:
             recs = pickle.load(f)
-
         filtered_records, filtered_segments = filter_segments(
             recs, segs, thresholds, rejected_dir
         )
@@ -618,51 +471,13 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
         print("No segments left after filtering.")
         return
 
-    from sklearn.model_selection import train_test_split
+    n = len(all_segments_final)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    train_segments = all_segments_final[:n_train]
+    val_segments = all_segments_final[n_train:n_train+n_val]
+    test_segments = all_segments_final[n_train+n_val:]
 
-    if out_prefix.lower().startswith("ptb"):
-        # ---- Split by patient_id ----
-        patient_ids = [rec.get("meta", {}).get("patient_id") for rec in all_records_final]
-        unique_patients = pd.Series(patient_ids).dropna().unique()
-
-        train_p, temp_p = train_test_split(unique_patients, test_size=0.30, random_state=42)
-        val_p, test_p = train_test_split(temp_p, test_size=0.50, random_state=42)
-
-        train_p, val_p, test_p = set(train_p), set(val_p), set(test_p)
-
-        train_segments, val_segments, test_segments = [], [], []
-        train_records, val_records, test_records = [], [], []
-
-        for rec, seg in zip(all_records_final, all_segments_final):
-            pid = rec.get("meta", {}).get("patient_id")
-            if pid in train_p:
-                train_segments.append(seg); train_records.append(rec)
-            elif pid in val_p:
-                val_segments.append(seg); val_records.append(rec)
-            elif pid in test_p:
-                test_segments.append(seg); test_records.append(rec)
-            else:
-                train_segments.append(seg); train_records.append(rec)
-
-        print(f"✅ Train patients: {len(train_p)}, Val patients: {len(val_p)}, Test patients: {len(test_p)}")
-
-    else:
-        # ---- Random split (LSAD) ----
-        idx = np.arange(len(all_segments_final))
-        train_idx, temp_idx = train_test_split(idx, test_size=0.30, random_state=42)
-        val_idx, test_idx = train_test_split(temp_idx, test_size=0.50, random_state=42)
-
-        train_segments = [all_segments_final[i] for i in train_idx]
-        val_segments   = [all_segments_final[i] for i in val_idx]
-        test_segments  = [all_segments_final[i] for i in test_idx]
-
-        train_records = [all_records_final[i] for i in train_idx]
-        val_records   = [all_records_final[i] for i in val_idx]
-        test_records  = [all_records_final[i] for i in test_idx]
-
-        print(f"✅ Random split (LSAD): {len(train_segments)} train, {len(val_segments)} val, {len(test_segments)} test")
-
-    # ---- Save final arrays ----
     np.save(save_dir / "train_segments.npy", np.stack(train_segments).astype(np.float32))
     np.save(save_dir / "val_segments.npy", np.stack(val_segments).astype(np.float32))
     np.save(save_dir / "test_segments.npy", np.stack(test_segments).astype(np.float32))
@@ -670,27 +485,23 @@ def process_batch(dataset_with_meta, out_prefix, n_workers=None,
     with open(save_dir / "records.pkl", "wb") as f:
         pickle.dump(all_records_final, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print(f"✅ Segments saved: {len(train_segments)} train, {len(val_segments)} val, {len(test_segments)} test")
-    print(f"✅ Saved records.pkl to {save_dir}")
-
-    # ---- Flatten CSV ----
     print("Saving flattened features CSV ...")
     rows = []
     for rec in all_records_final:
-        base = {}
-        base['record_id'] = rec.get('record_id')
-        base['segment_index'] = rec.get('segment_index')
+        base = {'record_id': rec.get('record_id'), 'segment_index': rec.get('segment_index')}
         meta = rec.get('meta', {}) or {}
         for k, v in meta.items():
-            if k == 'raw_features': continue
             base[f'meta_{k}'] = v
-        for k, v in (meta.get('raw_features', {}) or {}).items():
-            base[f'raw_{k}'] = v
         for k, v in (rec.get('features', {}) or {}).items():
             base[f'seg_{k}'] = v
         rows.append(base)
 
+    if rows:
+        df_rows = pd.DataFrame(rows)
+        df_rows.to_csv(save_dir / "records_features.csv", index=False)
+
     print(f"✅ Saved {len(train_segments)} train, {len(val_segments)} val, {len(test_segments)} test segments to {save_dir}")
+    print(f"✅ Saved records.pkl and records_features.csv to {save_dir}")
 
 # --------------------- Main ---------------------
 
@@ -702,10 +513,27 @@ if __name__ == "__main__":
     lsad_list = load_group_npy_files_with_meta(LSAD_DIR, meta_csv=LSAD_META_CSV)
     print(f"LSAD records found: {len(lsad_list)}")
 
-    # Process each source independently
     if len(ptbxl_list) > 0:
         process_batch(ptbxl_list, "ptbxl")
     if len(lsad_list) > 0:
         process_batch(lsad_list, "lsad")
+
+    if MERGED_META_CSV.exists():
+        try:
+            dfm = pd.read_csv(MERGED_META_CSV)
+            merged_rows = []
+            for _, row in dfm.iterrows():
+                p = Path(row['path'])
+                if p.exists():
+                    try:
+                        arr = np.load(p)
+                        if arr.ndim == 2 and arr.shape[1] == 12:
+                            merged_rows.append((arr.astype(np.float32), row.to_dict()))
+                    except Exception:
+                        continue
+            if len(merged_rows) > 0:
+                process_batch(merged_rows, "merged")
+        except Exception:
+            pass
 
     print("\nDone.")
